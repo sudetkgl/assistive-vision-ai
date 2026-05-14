@@ -4,3 +4,4 @@ torchvision
 easyocr
 opencv-python==4.9.0.80
 numpy<2
+pillow
