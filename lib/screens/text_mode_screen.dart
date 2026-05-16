@@ -1,11 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
-import 'package:flutter_tts/flutter_tts.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:permission_handler/permission_handler.dart';
+import '../l10n/app_strings.dart';
+import '../services/elevenlabs_tts.dart';
+import '../services/voice_command_service.dart';
+import '../widgets/app_bottom_nav.dart';
 
 class TextModeScreen extends StatefulWidget {
-  const TextModeScreen({super.key});
+  final String locale;
+  const TextModeScreen({super.key, required this.locale});
 
   @override
   State<TextModeScreen> createState() => _TextModeScreenState();
@@ -14,55 +18,85 @@ class TextModeScreen extends StatefulWidget {
 class _TextModeScreenState extends State<TextModeScreen>
     with SingleTickerProviderStateMixin {
   CameraController? _cameraController;
-  final FlutterTts _tts = FlutterTts();
+  final ElevenLabsTts _tts = ElevenLabsTts();
   final TextRecognizer _textRecognizer =
       TextRecognizer(script: TextRecognitionScript.latin);
 
   bool _isInitialized = false;
   bool _isProcessing = false;
   bool _isSpeaking = false;
-  String _statusText = 'Başlatılıyor...';
+  late String _statusText;
   List<String> _detectedTexts = [];
 
-  // Performans metrikleri
   int _captureMs = 0;
   int _ocrMs = 0;
   int _totalMs = 0;
   int _scanCount = 0;
   int _blockCount = 0;
-  bool _showMetrics = true;
+  bool _showMetrics = false;
 
   late AnimationController _waveController;
+  final VoiceCommandService _voice = VoiceCommandService();
 
-  static const _accentColor = Color(0xFF81C784);
+  static const _accentColor = Color(0xFF2563EB);
+  static const _dotColor = Color(0xFF4ADE80);
+
+  S get _s => S(widget.locale);
 
   @override
   void initState() {
     super.initState();
+    _statusText = _s.starting;
     _waveController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 900),
     );
+    _tts.onStart = () {
+      if (!mounted) return;
+      setState(() => _isSpeaking = true);
+      _waveController.repeat(reverse: true);
+      _voice.pause();
+    };
+    _tts.onComplete = () {
+      if (!mounted) return;
+      setState(() => _isSpeaking = false);
+      _waveController.stop();
+      _voice.resume();
+    };
     _initAll();
+    _initVoice();
+  }
+
+  Future<void> _initVoice() async {
+    final ok = await _voice.initialize(localeId: _s.ttsLocale);
+    if (!ok || !mounted) return;
+    _voice.register(
+      ['tara', 'scan', 'fotoğraf', 'çek', 'oku', 'başlat'],
+      _readText,
+    );
+    _voice.register(
+      ['durdur', 'dur', 'stop', 'sustur'],
+      () => _tts.stop(),
+    );
+    _voice.register(
+      ['tekrar', 'yeniden', 'repeat', 'söyle', 'oku'],
+      () {
+        if (_detectedTexts.isNotEmpty) {
+          _voice.pause();
+          _tts.speak(_detectedTexts.join('. '), locale: _s.ttsLocale);
+        }
+      },
+    );
+    _voice.register(
+      ['geri', 'çıkış', 'back', 'ana', 'anasayfa', 'çık'],
+      () { if (mounted) Navigator.pop(context); },
+    );
+    _voice.start();
   }
 
   Future<void> _initAll() async {
-    await _initTts();
     await Permission.camera.request();
     await _initCamera();
-  }
-
-  Future<void> _initTts() async {
-    await _tts.setLanguage('tr-TR');
-    await _tts.setSpeechRate(0.45);
-    _tts.setStartHandler(() {
-      if (mounted) setState(() => _isSpeaking = true);
-      _waveController.repeat(reverse: true);
-    });
-    _tts.setCompletionHandler(() {
-      if (mounted) setState(() => _isSpeaking = false);
-      _waveController.stop();
-    });
   }
 
   Future<void> _initCamera() async {
@@ -80,7 +114,7 @@ class _TextModeScreenState extends State<TextModeScreen>
     if (mounted) {
       setState(() {
         _isInitialized = true;
-        _statusText = 'Metin okumak için butona bas';
+        _statusText = _s.tapToScan;
       });
     }
   }
@@ -92,19 +126,17 @@ class _TextModeScreenState extends State<TextModeScreen>
 
     setState(() {
       _isProcessing = true;
-      _statusText = 'Taranıyor...';
+      _statusText = _s.scanning;
       _detectedTexts = [];
     });
 
     final totalWatch = Stopwatch()..start();
 
     try {
-      // Fotoğraf çekme süresi
       final captureWatch = Stopwatch()..start();
       final image = await _cameraController!.takePicture();
       captureWatch.stop();
 
-      // OCR işleme süresi
       final ocrWatch = Stopwatch()..start();
       final inputImage = InputImage.fromFilePath(image.path);
       final recognized = await _textRecognizer.processImage(inputImage);
@@ -117,7 +149,6 @@ class _TextModeScreenState extends State<TextModeScreen>
           .where((t) => t.length > 2)
           .toList();
 
-      // En fazla 5 blok göster, tamamını seslendir
       final displayTexts = allTexts.take(5).toList();
 
       _captureMs = captureWatch.elapsedMilliseconds;
@@ -138,19 +169,20 @@ class _TextModeScreenState extends State<TextModeScreen>
       setState(() {
         _detectedTexts = displayTexts;
         _statusText = allTexts.isEmpty
-            ? 'Metin bulunamadı'
-            : '${allTexts.length} metin bloğu · ${_ocrMs}ms';
+            ? _s.noTextFound
+            : _s.textBlocks(allTexts.length, _ocrMs);
       });
 
+      _voice.pause(); // stop STT before TTS starts
       if (allTexts.isEmpty) {
-        await _tts.speak('Metin algılanamadı');
+        await _tts.speak(_s.noTextDetected, locale: _s.ttsLocale);
       } else {
-        await _tts.speak(allTexts.join('. '));
+        await _tts.speak(allTexts.join('. '), locale: _s.ttsLocale);
       }
     } catch (e) {
       totalWatch.stop();
       debugPrint('OCR ERROR: $e');
-      setState(() => _statusText = 'Hata: $e');
+      setState(() => _statusText = 'Error: $e');
     } finally {
       if (mounted) setState(() => _isProcessing = false);
     }
@@ -159,8 +191,9 @@ class _TextModeScreenState extends State<TextModeScreen>
   @override
   void dispose() {
     _waveController.dispose();
+    _voice.dispose();
     _cameraController?.dispose();
-    _tts.stop();
+    _tts.dispose();
     _textRecognizer.close();
     super.dispose();
   }
@@ -169,17 +202,22 @@ class _TextModeScreenState extends State<TextModeScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0A),
+      bottomNavigationBar: AppBottomNav(
+        currentIndex: 0,
+        onTap: (i) {
+          if (i == 0) Navigator.pop(context);
+        },
+      ),
       body: Stack(
         children: [
-          // Kamera tam ekran
           if (_isInitialized)
             Positioned.fill(child: CameraPreview(_cameraController!))
           else
             const Center(
-              child: CircularProgressIndicator(color: Color(0xFF81C784)),
+              child: CircularProgressIndicator(color: _accentColor),
             ),
 
-          // Üst bar
+          // Top bar
           Positioned(
             top: 0,
             left: 0,
@@ -190,40 +228,50 @@ class _TextModeScreenState extends State<TextModeScreen>
                     const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                 child: Row(
                   children: [
-                    GestureDetector(
-                      onTap: () => Navigator.pop(context),
-                      child: Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.5),
-                          borderRadius: BorderRadius.circular(10),
+                    Semantics(
+                      label: widget.locale == 'tr' ? 'Geri' : 'Back',
+                      button: true,
+                      hint: widget.locale == 'tr'
+                          ? 'Ana ekrana dön'
+                          : 'Go back to home screen',
+                      child: GestureDetector(
+                        onTap: () => Navigator.pop(context),
+                        child: Container(
+                          width: 44,
+                          height: 44,
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withOpacity(0.5),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: const Icon(Icons.arrow_back_ios_new,
+                              color: Colors.white, size: 18),
                         ),
-                        child: const Icon(Icons.arrow_back_ios_new,
-                            color: Colors.white, size: 16),
                       ),
                     ),
                     const SizedBox(width: 12),
                     Container(
                       padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 6),
+                          horizontal: 12, vertical: 8),
                       decoration: BoxDecoration(
                         color: Colors.black.withOpacity(0.5),
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: Row(
+                        mainAxisSize: MainAxisSize.min,
                         children: [
                           Container(
-                            width: 7,
-                            height: 7,
+                            width: 8,
+                            height: 8,
                             decoration: const BoxDecoration(
-                              color: Color(0xFF81C784),
+                              color: _dotColor,
                               shape: BoxShape.circle,
                             ),
                           ),
                           const SizedBox(width: 6),
-                          const Text(
-                            'METİN OKUMA',
-                            style: TextStyle(
+                          Text(
+                            _s.textModeTitle,
+                            style: const TextStyle(
                               color: Colors.white,
                               fontSize: 11,
                               fontWeight: FontWeight.w600,
@@ -234,26 +282,36 @@ class _TextModeScreenState extends State<TextModeScreen>
                       ),
                     ),
                     const Spacer(),
-                    // Metrik toggle butonu
-                    GestureDetector(
-                      onTap: () => setState(() => _showMetrics = !_showMetrics),
-                      child: Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: _showMetrics
-                              ? _accentColor.withOpacity(0.2)
-                              : Colors.black.withOpacity(0.5),
-                          borderRadius: BorderRadius.circular(10),
-                          border: _showMetrics
-                              ? Border.all(
-                                  color: _accentColor.withOpacity(0.5))
-                              : null,
-                        ),
-                        child: Icon(Icons.speed,
+                    Semantics(
+                      label: widget.locale == 'tr'
+                          ? 'Performans metrikleri'
+                          : 'Performance metrics',
+                      button: true,
+                      hint: widget.locale == 'tr'
+                          ? 'Teknik detayları göster veya gizle'
+                          : 'Show or hide technical details',
+                      child: GestureDetector(
+                        onTap: () =>
+                            setState(() => _showMetrics = !_showMetrics),
+                        child: Container(
+                          width: 44,
+                          height: 44,
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
                             color: _showMetrics
-                                ? _accentColor
-                                : Colors.white54,
-                            size: 16),
+                                ? _accentColor.withOpacity(0.2)
+                                : Colors.black.withOpacity(0.5),
+                            borderRadius: BorderRadius.circular(10),
+                            border: _showMetrics
+                                ? Border.all(
+                                    color: _accentColor.withOpacity(0.5))
+                                : null,
+                          ),
+                          child: Icon(Icons.speed,
+                              color:
+                                  _showMetrics ? _accentColor : Colors.white54,
+                              size: 18),
+                        ),
                       ),
                     ),
                   ],
@@ -262,7 +320,7 @@ class _TextModeScreenState extends State<TextModeScreen>
             ),
           ),
 
-          // Performans metrikleri overlay
+          // Metrics overlay
           if (_showMetrics && _scanCount > 0)
             Positioned(
               top: 90,
@@ -273,8 +331,7 @@ class _TextModeScreenState extends State<TextModeScreen>
                 decoration: BoxDecoration(
                   color: Colors.black.withOpacity(0.75),
                   borderRadius: BorderRadius.circular(10),
-                  border:
-                      Border.all(color: _accentColor.withOpacity(0.3)),
+                  border: Border.all(color: _accentColor.withOpacity(0.3)),
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.end,
@@ -295,12 +352,12 @@ class _TextModeScreenState extends State<TextModeScreen>
                         color: Colors.white),
                     const SizedBox(height: 2),
                     _MetricRow(
-                        label: 'blok',
+                        label: _s.metricBlock,
                         value: '$_blockCount',
                         color: Colors.white70),
                     const SizedBox(height: 2),
                     _MetricRow(
-                        label: 'tarama',
+                        label: _s.metricScan,
                         value: '#$_scanCount',
                         color: Colors.white54),
                   ],
@@ -308,13 +365,12 @@ class _TextModeScreenState extends State<TextModeScreen>
               ),
             ),
 
-          // Tarama çizgisi animasyonu
           if (_isProcessing)
             Positioned.fill(
               child: _ScanLine(color: _accentColor),
             ),
 
-          // Alt panel
+          // Bottom panel
           Positioned(
             left: 0,
             right: 0,
@@ -339,7 +395,6 @@ class _TextModeScreenState extends State<TextModeScreen>
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      // TTS dalgası
                       if (_isSpeaking) ...[
                         _TtsWave(
                             animation: _waveController,
@@ -347,7 +402,6 @@ class _TextModeScreenState extends State<TextModeScreen>
                         const SizedBox(height: 12),
                       ],
 
-                      // Algılanan metinler
                       if (_detectedTexts.isNotEmpty) ...[
                         Container(
                           width: double.infinity,
@@ -381,55 +435,69 @@ class _TextModeScreenState extends State<TextModeScreen>
                         ),
                       ],
 
-                      // Durum metni
-                      Text(
-                        _statusText,
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.7),
-                          fontSize: 13,
-                        ),
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 16),
-
-                      // Buton
-                      GestureDetector(
-                        onTap: _isProcessing ? null : _readText,
-                        child: Container(
-                          width: double.infinity,
-                          height: 58,
-                          decoration: BoxDecoration(
-                            color: _isProcessing
-                                ? _accentColor.withOpacity(0.3)
-                                : _accentColor,
-                            borderRadius: BorderRadius.circular(16),
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: Text(
+                          _statusText,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 16,
                           ),
-                          child: Center(
-                            child: _isProcessing
-                                ? const SizedBox(
-                                    width: 22,
-                                    height: 22,
-                                    child: CircularProgressIndicator(
-                                        color: Colors.white, strokeWidth: 2),
-                                  )
-                                : const Row(
-                                    mainAxisAlignment:
-                                        MainAxisAlignment.center,
-                                    children: [
-                                      Icon(Icons.document_scanner_outlined,
-                                          color: Colors.black, size: 20),
-                                      SizedBox(width: 8),
-                                      Text(
-                                        'METİN OKU',
-                                        style: TextStyle(
-                                          color: Colors.black,
-                                          fontSize: 15,
-                                          fontWeight: FontWeight.w700,
-                                          letterSpacing: 1,
-                                        ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+
+                      Semantics(
+                        label: _s.readTextBtnSemantic,
+                        button: true,
+                        hint: widget.locale == 'tr'
+                            ? 'Metni taramak için butona bas'
+                            : 'Press to scan text',
+                        child: GestureDetector(
+                          onTap: _isProcessing ? null : _readText,
+                          child: Container(
+                            width: double.infinity,
+                            constraints: const BoxConstraints(minHeight: 64),
+                            decoration: BoxDecoration(
+                              color: _isProcessing
+                                  ? _accentColor.withOpacity(0.3)
+                                  : _accentColor,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: Center(
+                              child: Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 16),
+                                child: _isProcessing
+                                    ? const SizedBox(
+                                        width: 22,
+                                        height: 22,
+                                        child: CircularProgressIndicator(
+                                            color: Colors.white,
+                                            strokeWidth: 2),
+                                      )
+                                    : Row(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.center,
+                                        children: [
+                                          const Icon(
+                                              Icons.document_scanner_outlined,
+                                              color: Colors.white,
+                                              size: 20),
+                                          const SizedBox(width: 8),
+                                          Text(
+                                            _s.readTextBtn,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 18,
+                                              fontWeight: FontWeight.w700,
+                                              letterSpacing: 1.2,
+                                            ),
+                                          ),
+                                        ],
                                       ),
-                                    ],
-                                  ),
+                              ),
+                            ),
                           ),
                         ),
                       ),

@@ -1,44 +1,34 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
-import 'package:flutter_tts/flutter_tts.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter/services.dart';
-
-const Map<String, Map<String, dynamic>> assistiveCategories = {
-  'car':          {'label': 'Araç',            'priority': 1, 'danger': true},
-  'bus':          {'label': 'Araç',            'priority': 1, 'danger': true},
-  'truck':        {'label': 'Araç',            'priority': 1, 'danger': true},
-  'motorcycle':   {'label': 'Araç',            'priority': 1, 'danger': true},
-  'bicycle':      {'label': 'Bisiklet',        'priority': 1, 'danger': true},
-  'person':       {'label': 'İnsan',           'priority': 2, 'danger': false},
-  'chair':        {'label': 'Engel',           'priority': 3, 'danger': false},
-  'bench':        {'label': 'Engel',           'priority': 3, 'danger': false},
-  'couch':        {'label': 'Engel',           'priority': 3, 'danger': false},
-  'potted plant': {'label': 'Engel',           'priority': 3, 'danger': false},
-  'bottle':       {'label': 'Küçük nesne',     'priority': 4, 'danger': false},
-  'cup':          {'label': 'Küçük nesne',     'priority': 4, 'danger': false},
-  'cell phone':   {'label': 'Kişisel eşya',    'priority': 4, 'danger': false},
-  'book':         {'label': 'Kişisel eşya',    'priority': 4, 'danger': false},
-  'laptop':       {'label': 'Elektronik eşya', 'priority': 4, 'danger': false},
-};
+import '../l10n/app_strings.dart';
+import '../services/elevenlabs_tts.dart';
+import '../services/scene_describer.dart';
+import '../services/settings_service.dart';
+import '../services/voice_command_service.dart';
+import '../widgets/app_bottom_nav.dart';
 
 class ObjectModeScreen extends StatefulWidget {
-  const ObjectModeScreen({super.key});
+  final String locale;
+  const ObjectModeScreen({super.key, required this.locale});
 
   @override
   State<ObjectModeScreen> createState() => _ObjectModeScreenState();
 }
 
 class _ObjectModeScreenState extends State<ObjectModeScreen>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   CameraController? _cameraController;
-  final FlutterTts _tts = FlutterTts();
+  final ElevenLabsTts _tts = ElevenLabsTts();
+  final SceneDescriber _describer = SceneDescriber();
   final Battery _battery = Battery();
 
   Interpreter? _interpreter;
@@ -48,15 +38,15 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
   bool _isInitialized = false;
   bool _isAnalyzing = false;
   bool _isSpeaking = false;
-  String _statusText = 'Başlatılıyor...';
+  late String _statusText;
   String _detectionLabel = '';
   bool _isDanger = false;
   String _lastSpokenMessage = '';
-  DateTime _lastSpokenTime = DateTime.now().subtract(const Duration(seconds: 10));
+  DateTime _lastSpokenTime =
+      DateTime.now().subtract(const Duration(seconds: 10));
   DateTime _lastFrameTime = DateTime.now();
   int _fps = 5;
 
-  // Performans metrikleri
   int _actualFps = 0;
   int _prepMs = 0;
   int _inferMs = 0;
@@ -64,41 +54,84 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
   int _frameCount = 0;
   DateTime _fpsWindowStart = DateTime.now();
 
+  int _objectCount = 0;
+  String _prevDetectionLabel = '';
+  bool _showDebugInfo = false;
+  bool _isDisposed = false;
+  int _tapCount = 0;
+  DateTime _lastTapTime = DateTime.now();
+
   late AnimationController _waveController;
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
+
+  final VoiceCommandService _voice = VoiceCommandService();
 
   static const _blueColor = Color(0xFF4FC3F7);
   static const _dangerColor = Color(0xFFFF5252);
+  static const _liveColor = Color(0xFF22C55E);
+
+  S get _s => S(widget.locale);
 
   @override
   void initState() {
     super.initState();
+    _statusText = _s.starting;
+    _describer.setLanguage(widget.locale);
     _waveController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 900),
     );
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1000),
+    )..repeat(reverse: true);
+    _pulseAnimation =
+        Tween<double>(begin: 0.35, end: 1.0).animate(_pulseController);
+    _tts.onStart = () {
+      if (!mounted) return;
+      setState(() => _isSpeaking = true);
+      _waveController.repeat(reverse: true);
+      _voice.pause();
+    };
+    _tts.onComplete = () {
+      if (!mounted) return;
+      setState(() => _isSpeaking = false);
+      _waveController.stop();
+      _voice.resume();
+    };
     _initAll();
+    _initVoice();
+  }
+
+  Future<void> _initVoice() async {
+    final ok = await _voice.initialize(localeId: _s.ttsLocale);
+    if (!ok || !mounted) return;
+    _voice.register(
+      ['durdur', 'dur', 'stop', 'sustur', 'pause'],
+      () => _tts.stop(),
+    );
+    _voice.register(
+      ['tekrar', 'yeniden', 'repeat', 'söyle', 'ne var'],
+      () {
+        if (_detectionLabel.isNotEmpty) {
+          _tts.speak(_detectionLabel, locale: _s.ttsLocale);
+        }
+      },
+    );
+    _voice.register(
+      ['geri', 'çıkış', 'back', 'ana', 'anasayfa', 'çık'],
+      () { if (mounted) Navigator.pop(context); },
+    );
+    _voice.start();
   }
 
   Future<void> _initAll() async {
-    await _initTts();
     await _requestPermissions();
     await _initCamera();
     await _loadModel();
     _monitorBattery();
     _startStream();
-  }
-
-  Future<void> _initTts() async {
-    await _tts.setLanguage('tr-TR');
-    await _tts.setSpeechRate(0.5);
-    _tts.setStartHandler(() {
-      if (mounted) setState(() => _isSpeaking = true);
-      _waveController.repeat(reverse: true);
-    });
-    _tts.setCompletionHandler(() {
-      if (mounted) setState(() => _isSpeaking = false);
-      _waveController.stop();
-    });
   }
 
   Future<void> _requestPermissions() async {
@@ -117,28 +150,36 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
     );
 
     await _cameraController!.initialize();
-    if (mounted) setState(() => _statusText = 'Model yükleniyor...');
+    if (mounted) setState(() => _statusText = _s.loadingModel);
   }
 
   Future<void> _loadModel() async {
-    // Load labels
     final labelData = await rootBundle.loadString('assets/models/labels.txt');
     _labels = labelData.trim().split('\n');
 
-    // Load TFLite interpreter
     final interpreterOptions = InterpreterOptions()..threads = 2;
+
+    if (Platform.isIOS) {
+      try {
+        interpreterOptions.addDelegate(CoreMlDelegate());
+        debugPrint('CoreML delegate etkinleştirildi');
+      } catch (e) {
+        debugPrint('CoreML delegate kullanılamıyor, CPU\'ya geçiliyor: $e');
+      }
+    }
+
     _interpreter = await Interpreter.fromAsset(
       'assets/models/yolo.tflite',
       options: interpreterOptions,
     );
 
     final inputShape = _interpreter!.getInputTensor(0).shape;
-    _inputSize = inputShape[1]; // e.g. 640
+    _inputSize = inputShape[1];
 
     if (mounted) {
       setState(() {
         _isInitialized = true;
-        _statusText = 'Dinleniyor...';
+        _statusText = _s.listening;
       });
     }
   }
@@ -171,21 +212,26 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
     });
   }
 
-  String _getPosition(double xCenter, double frameWidth) {
-    if (xCenter < frameWidth / 3) return 'sol tarafta';
-    if (xCenter < 2 * frameWidth / 3) return 'önünde';
-    return 'sağ tarafta';
+  void _onTitleTap() {
+    final now = DateTime.now();
+    if (now.difference(_lastTapTime).inMilliseconds > 800) _tapCount = 0;
+    _tapCount++;
+    _lastTapTime = now;
+    if (_tapCount >= 3) {
+      _tapCount = 0;
+      if (mounted) setState(() => _showDebugInfo = !_showDebugInfo);
+    }
   }
 
   Future<void> _speak(String message) async {
     final now = DateTime.now();
     final elapsed = now.difference(_lastSpokenTime).inMilliseconds;
-    // Aynı mesajı 5 saniye içinde tekrarlama; farklı mesaj için 2 saniye bekle
     if (message == _lastSpokenMessage && elapsed < 5000) return;
-    if (elapsed < 2000) return;
+    if (elapsed < SettingsService.instance.descriptionInterval) return;
     _lastSpokenMessage = message;
     _lastSpokenTime = now;
-    await _tts.speak(message);
+    _voice.pause(); // stop STT before TTS starts
+    await _tts.speak(message, locale: _s.ttsLocale);
   }
 
   Future<Float32List> _preprocessImageAsync(CameraImage image) {
@@ -197,18 +243,14 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
     ));
   }
 
-  // Parse YOLOv8 output tensor [1, 84, 8400]
-  // Rows 0-3: cx, cy, w, h (normalized)
-  // Rows 4-83: class scores (no separate objectness in YOLOv8)
   List<Map<String, dynamic>> _parseOutput(
       List<List<List<double>>> output, double confThreshold) {
     const int numClasses = 80;
-    final int numBoxes = output[0][0].length; // 8400
+    final int numBoxes = output[0][0].length;
 
     final List<Map<String, dynamic>> detections = [];
 
     for (int i = 0; i < numBoxes; i++) {
-      // Find best class
       int bestClass = 0;
       double bestScore = 0.0;
       for (int c = 0; c < numClasses; c++) {
@@ -227,7 +269,6 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
       final double bw = output[0][2][i];
       final double bh = output[0][3][i];
 
-      // Convert to x1,y1,x2,y2 (still normalized 0-1)
       final double x1 = cx - bw / 2;
       final double y1 = cy - bh / 2;
       final double x2 = cx + bw / 2;
@@ -249,7 +290,8 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
 
   List<Map<String, dynamic>> _nms(
       List<Map<String, dynamic>> boxes, double iouThreshold) {
-    boxes.sort((a, b) => (b['score'] as double).compareTo(a['score'] as double));
+    boxes.sort(
+        (a, b) => (b['score'] as double).compareTo(a['score'] as double));
     final List<Map<String, dynamic>> result = [];
     final List<bool> suppressed = List.filled(boxes.length, false);
 
@@ -280,19 +322,20 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
   }
 
   Future<void> _analyzeFrame(CameraImage image) async {
-    if (!_isInitialized || _interpreter == null) return;
+    if (!_isInitialized || _interpreter == null || _isDisposed) return;
     _isAnalyzing = true;
 
     final totalWatch = Stopwatch()..start();
 
     try {
-      // Preprocessing süresi
       final prepWatch = Stopwatch()..start();
       final Float32List inputData = await _preprocessImageAsync(image);
-      final inputTensor = inputData.reshape([1, _inputSize, _inputSize, 3]);
       prepWatch.stop();
 
-      // Output tensörü hazırla
+      // Re-check after async gap — screen may have been disposed
+      if (_isDisposed || _interpreter == null) return;
+
+      final inputTensor = inputData.reshape([1, _inputSize, _inputSize, 3]);
       final outputShape = _interpreter!.getOutputTensor(0).shape;
       final List<List<List<double>>> outputTensor = List.generate(
         outputShape[0],
@@ -302,19 +345,24 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
         ),
       );
 
-      // Inference süresi
       final inferWatch = Stopwatch()..start();
       _interpreter!.run(inputTensor, outputTensor);
       inferWatch.stop();
 
       final detections = _parseOutput(outputTensor, 0.4);
-      final filtered = detections
-          .where((d) => assistiveCategories.containsKey(d['tag'] as String))
-          .toList();
 
-      // Gerçek FPS hesapla (1 saniyelik pencere)
+      final yoloDetections = detections.map((d) => YoloDetection(
+        label: d['tag'] as String,
+        confidence: d['score'] as double,
+        boundingBox: Rect.fromLTRB(
+          d['x1'] as double, d['y1'] as double,
+          d['x2'] as double, d['y2'] as double,
+        ),
+      )).toList();
+
       _frameCount++;
-      final windowMs = DateTime.now().difference(_fpsWindowStart).inMilliseconds;
+      final windowMs =
+          DateTime.now().difference(_fpsWindowStart).inMilliseconds;
       if (windowMs >= 1000) {
         _actualFps = (_frameCount * 1000 / windowMs).round();
         _frameCount = 0;
@@ -329,40 +377,24 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
       debugPrint('PERF prep=${_prepMs}ms infer=${_inferMs}ms '
           'total=${_totalMs}ms fps=$_actualFps');
 
-      if (filtered.isEmpty) {
-        if (mounted) {
-          setState(() {
-            _detectionLabel = '';
-            _isDanger = false;
-            _statusText = 'prep:${_prepMs}ms  infer:${_inferMs}ms  $_actualFps fps';
-          });
-        }
-        return;
+      final description = _describer.describe(yoloDetections);
+      final hasDanger = _describer.hasDanger(yoloDetections);
+
+      if (description != _prevDetectionLabel) {
+        if (SettingsService.instance.vibration) HapticFeedback.mediumImpact();
+        _prevDetectionLabel = description;
       }
-
-      filtered.sort((a, b) {
-        final pa = assistiveCategories[a['tag']]!['priority'] as int;
-        final pb = assistiveCategories[b['tag']]!['priority'] as int;
-        return pa.compareTo(pb);
-      });
-
-      final top = filtered.first;
-      final tag = top['tag'] as String;
-      final xCenter = ((top['x1'] as double) + (top['x2'] as double)) / 2;
-      final position = _getPosition(xCenter, 1.0);
-      final label = assistiveCategories[tag]!['label'] as String;
-      final danger = assistiveCategories[tag]!['danger'] as bool;
-
-      final message = '$label $position';
-      await _speak(message);
 
       if (mounted) {
         setState(() {
-          _detectionLabel = message;
-          _isDanger = danger;
-          _statusText =
-              '${filtered.length} nesne  prep:${_prepMs}ms  infer:${_inferMs}ms  $_actualFps fps';
+          _detectionLabel = description;
+          _isDanger = hasDanger;
+          _objectCount = yoloDetections.length;
         });
+      }
+
+      if (description.isNotEmpty) {
+        await _speak(description);
       }
     } catch (e) {
       debugPrint('analyzeFrame error: $e');
@@ -373,11 +405,23 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
 
   @override
   void dispose() {
+    _isDisposed = true;
     _waveController.dispose();
-    _cameraController?.stopImageStream();
-    _cameraController?.dispose();
-    _tts.stop();
-    _interpreter?.close();
+    _pulseController.dispose();
+    _voice.dispose();
+    _tts.dispose();
+    if (_cameraController?.value.isInitialized == true) {
+      if (_cameraController!.value.isStreamingImages) {
+        _cameraController!.stopImageStream().then((_) {
+          _cameraController!.dispose();
+        });
+      } else {
+        _cameraController!.dispose();
+      }
+    }
+    final interp = _interpreter;
+    _interpreter = null;
+    interp?.close();
     super.dispose();
   }
 
@@ -387,9 +431,14 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
 
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0A),
+      bottomNavigationBar: AppBottomNav(
+        currentIndex: 0,
+        onTap: (i) {
+          if (i == 0) Navigator.pop(context);
+        },
+      ),
       body: Stack(
         children: [
-          // Kamera tam ekran
           if (_isInitialized)
             Positioned.fill(child: CameraPreview(_cameraController!))
           else
@@ -397,7 +446,6 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
               child: CircularProgressIndicator(color: _blueColor),
             ),
 
-          // Tehlike overlay
           if (_isDanger)
             Positioned.fill(
               child: IgnorePointer(
@@ -409,7 +457,7 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
               ),
             ),
 
-          // Üst bar
+          // Top bar
           Positioned(
             top: 0,
             left: 0,
@@ -420,73 +468,111 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
                     const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                 child: Row(
                   children: [
+                    Semantics(
+                      label: widget.locale == 'tr' ? 'Geri' : 'Back',
+                      button: true,
+                      hint: widget.locale == 'tr'
+                          ? 'Ana ekrana dön'
+                          : 'Go back to home screen',
+                      child: GestureDetector(
+                        onTap: () => Navigator.pop(context),
+                        child: Container(
+                          width: 44,
+                          height: 44,
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withOpacity(0.5),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: const Icon(Icons.arrow_back_ios_new,
+                              color: Colors.white, size: 18),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
                     GestureDetector(
-                      onTap: () => Navigator.pop(context),
+                      onTap: _onTitleTap,
                       child: Container(
-                        padding: const EdgeInsets.all(8),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 8),
                         decoration: BoxDecoration(
                           color: Colors.black.withOpacity(0.5),
                           borderRadius: BorderRadius.circular(10),
                         ),
-                        child: const Icon(Icons.arrow_back_ios_new,
-                            color: Colors.white, size: 16),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.5),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 7,
-                            height: 7,
-                            decoration: const BoxDecoration(
-                              color: _blueColor,
-                              shape: BoxShape.circle,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            AnimatedBuilder(
+                              animation: _pulseAnimation,
+                              builder: (_, __) => Container(
+                                width: 8,
+                                height: 8,
+                                decoration: BoxDecoration(
+                                  color: _liveColor
+                                      .withOpacity(_pulseAnimation.value),
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
                             ),
-                          ),
-                          const SizedBox(width: 6),
-                          const Text(
-                            'NESNE TESPİTİ',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 11,
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: 1.5,
+                            const SizedBox(width: 6),
+                            Text(
+                              _s.objectModeTitle,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                letterSpacing: 1.5,
+                              ),
                             ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const Spacer(),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.5),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Text(
-                        '$_actualFps fps  ${_totalMs}ms',
-                        style: const TextStyle(
-                          color: Color(0xFF888888),
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
+                            if (_isInitialized) ...[
+                              const SizedBox(width: 8),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: _liveColor.withOpacity(0.2),
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Text(
+                                  _s.liveLabel,
+                                  style: const TextStyle(
+                                    color: _liveColor,
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.w700,
+                                    letterSpacing: 1,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
                       ),
                     ),
+                    const Spacer(),
+                    if (_showDebugInfo)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.5),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          '$_actualFps fps  ${_totalMs}ms',
+                          style: const TextStyle(
+                            color: Color(0xFF888888),
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
                   ],
                 ),
               ),
             ),
           ),
 
-          // Alt panel
+          // Bottom panel
           Positioned(
             left: 0,
             right: 0,
@@ -513,53 +599,72 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
                     children: [
                       if (_isSpeaking) ...[
                         _TtsWave(
-                            animation: _waveController,
-                            color: accentColor),
+                            animation: _waveController, color: accentColor),
                         const SizedBox(height: 12),
                       ],
 
                       if (_detectionLabel.isNotEmpty)
                         Container(
                           width: double.infinity,
+                          constraints: const BoxConstraints(minHeight: 96),
                           padding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 12),
+                              horizontal: 16, vertical: 16),
                           margin: const EdgeInsets.only(bottom: 10),
                           decoration: BoxDecoration(
-                            color: accentColor.withOpacity(0.12),
-                            borderRadius: BorderRadius.circular(12),
+                            color: const Color(0xFF0F172A).withOpacity(0.95),
+                            borderRadius: BorderRadius.circular(16),
                             border: Border.all(
                                 color: accentColor.withOpacity(0.4)),
                           ),
-                          child: Row(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
                             children: [
-                              Icon(
-                                _isDanger
-                                    ? Icons.warning_amber_rounded
-                                    : Icons.location_on_outlined,
-                                color: accentColor,
-                                size: 18,
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Icon(
+                                    _isDanger
+                                        ? Icons.warning_amber_rounded
+                                        : Icons.location_on_outlined,
+                                    color: accentColor,
+                                    size: 22,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(
+                                      _detectionLabel,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 24,
+                                        fontWeight: FontWeight.w600,
+                                        height: 1.2,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
-                              const SizedBox(width: 8),
+                              const SizedBox(height: 6),
                               Text(
-                                _detectionLabel,
-                                style: TextStyle(
-                                  color: accentColor,
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w600,
+                                _s.objectsDetectedPlain(_objectCount),
+                                style: const TextStyle(
+                                  color: Color(0xFF94A3B8),
+                                  fontSize: 14,
                                 ),
                               ),
                             ],
                           ),
                         ),
 
-                      Text(
-                        _statusText,
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.5),
-                          fontSize: 12,
+                      if (_detectionLabel.isEmpty)
+                        Text(
+                          _statusText,
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.5),
+                            fontSize: 14,
+                          ),
+                          textAlign: TextAlign.center,
                         ),
-                        textAlign: TextAlign.center,
-                      ),
                     ],
                   ),
                 ),
@@ -572,7 +677,6 @@ class _ObjectModeScreenState extends State<ObjectModeScreen>
   }
 }
 
-// Top-level sınıf ve fonksiyon — compute() ile ayrı isolate'te çalışır
 class _PreprocessArgs {
   final Uint8List bytes;
   final int srcW;

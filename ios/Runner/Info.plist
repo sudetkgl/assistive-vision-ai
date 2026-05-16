@@ -29,7 +29,9 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Kamera, nesne tespiti ve metin okuma için kullanılmaktadır.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Sesli geri bildirim için mikrofon gereklidir.</string>
+	<string>Sesli komutlar ve geri bildirim için mikrofon gereklidir.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Eller serbest kullanım için sesli komut tanıma gereklidir.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
